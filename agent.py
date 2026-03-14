@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import httpx
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -13,25 +14,27 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 def read_file(file_path: str) -> str:
     safe_path = (PROJECT_ROOT / file_path).resolve()
     if not str(safe_path).startswith(str(PROJECT_ROOT)):
-        raise ValueError("Path traversal detected!")
+        return "Error: Path traversal detected!"
     if not safe_path.exists():
         return f"Error: File not found: {file_path}"
-    return safe_path.read_text()
+    try:
+        return safe_path.read_text()[:5000]
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-def list_files(dir_path: str) -> list:
+def list_files(dir_path: str) -> str:
     safe_path = (PROJECT_ROOT / dir_path).resolve()
     if not str(safe_path).startswith(str(PROJECT_ROOT)):
-        raise ValueError("Path traversal detected!")
+        return "Error: Path traversal detected!"
     if not safe_path.exists():
         return f"Error: Directory not found: {dir_path}"
-    return [str(p.relative_to(PROJECT_ROOT)) for p in safe_path.iterdir()]
+    try:
+        files = [str(p.relative_to(PROJECT_ROOT)) for p in safe_path.iterdir()]
+        return json.dumps(files)
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-TOOLS = {
-    "read_file": {"description": "Read content of a file", "parameters": {"path": "string"}},
-    "list_files": {"description": "List files in a directory", "parameters": {"dir": "string"}}
-}
-
-def call_llm(messages: list) -> dict:
+def call_llm(messages: list) -> str:
     response = httpx.post(
         os.getenv("LLM_API_BASE") + "/chat/completions",
         headers={
@@ -47,53 +50,76 @@ def call_llm(messages: list) -> dict:
     )
     data = response.json()
     if "choices" in data and len(data["choices"]) > 0:
-        content = data["choices"][0]["message"]["content"]
-        try:
-            return json.loads(content)
-        except:
-            return {"answer": content}
-    return {"answer": "API error"}
+        return data["choices"][0]["message"]["content"]
+    return "API error"
 
-def execute_tool(tool_name: str, args: dict) -> str:
-    if tool_name == "read_file":
-        return read_file(args.get("path", ""))
-    elif tool_name == "list_files":
-        return json.dumps(list_files(args.get("dir", "")))
-    return f"Unknown tool: {tool_name}"
+def parse_tool_call(content: str) -> dict:
+    # Try JSON format first
+    try:
+        data = json.loads(content)
+        if "tool_call" in data and data["tool_call"]:
+            return data["tool_call"]
+        if "tool" in data:
+            return {"tool": data["tool"], "args": data.get("args", {})}
+    except:
+        pass
+    
+    # Try XML-like format: <function=list_files dir="." />
+    list_match = re.search(r'<function[=:\s]+list_files[^>]*dir[=:\s]+["\']?([^"\'\s>]+)["\']?', content, re.IGNORECASE)
+    if list_match:
+        return {"tool": "list_files", "args": {"dir": list_match.group(1)}}
+    
+    # Try: list_files(dir=".")
+    list_match2 = re.search(r'list_files\s*\(\s*dir\s*[=:]\s*["\']?([^"\'\)]+)["\']?\s*\)', content, re.IGNORECASE)
+    if list_match2:
+        return {"tool": "list_files", "args": {"dir": list_match2.group(1)}}
+    
+    # Try: read_file(path="...")
+    read_match = re.search(r'read_file\s*\(\s*path\s*[=:]\s*["\']?([^"\'\)]+)["\']?\s*\)', content, re.IGNORECASE)
+    if read_match:
+        return {"tool": "read_file", "args": {"path": read_match.group(1)}}
+    
+    return None
 
 def agent_loop(question: str, max_iterations: int = 10) -> dict:
-    system_prompt = """You are a documentation agent. You can use tools to read files and list directories.
-Available tools:
-- read_file(path): Read content of a file
-- list_files(dir): List files in a directory
+    system_prompt = """You are a documentation agent. You have two tools:
+1. list_files(dir=".") - List files in a directory
+2. read_file(path="file.txt") - Read a file
+
+To use a tool, write exactly: list_files(dir=".") or read_file(path="AGENT.md")
 
 Respond in JSON format:
-{
-  "answer": "your answer or empty if calling tool",
-  "source": "file path if applicable",
-  "tool_call": {"tool": "tool_name", "args": {"arg": "value"}} or null
-}
+{"answer": "your answer", "tool_call": {"tool": "list_files", "args": {"dir": "."}}}
 
-If you can answer directly, set tool_call to null.
-If you need to read a file, set tool_call with the tool name and args.
-"""
-    
+If you can answer directly, set tool_call to null."""
+
     messages = [{"role": "system", "content": system_prompt}]
     messages.append({"role": "user", "content": question})
     tool_calls_log = []
     
     for i in range(max_iterations):
-        response = call_llm(messages)
+        content = call_llm(messages)
         
-        if not response.get("tool_call"):
+        tool_call = parse_tool_call(content)
+        
+        if not tool_call:
             return {
-                "answer": response.get("answer", ""),
-                "source": response.get("source", ""),
+                "answer": content,
+                "source": "",
                 "tool_calls": tool_calls_log
             }
         
-        tool_result = execute_tool(response["tool_call"]["tool"], response["tool_call"]["args"])
-        tool_calls_log.append({**response["tool_call"], "result": tool_result})
+        tool_name = tool_call.get("tool", "")
+        tool_args = tool_call.get("args", {})
+        
+        if tool_name == "read_file":
+            tool_result = read_file(tool_args.get("path", ""))
+        elif tool_name == "list_files":
+            tool_result = list_files(tool_args.get("dir", ""))
+        else:
+            tool_result = f"Unknown tool: {tool_name}"
+        
+        tool_calls_log.append({"tool": tool_name, "args": tool_args, "result": tool_result})
         messages.append({"role": "assistant", "content": f"Tool result: {tool_result}"})
     
     return {"answer": "Max iterations reached", "tool_calls": tool_calls_log}
